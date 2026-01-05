@@ -88,12 +88,20 @@ function generateRequestId() {
 }
 
 const ANSI_REGEX = /\x1B\[[0-?]*[ -/]*[@-~]/g;
+// Zero-width code points that should not contribute to printed width
 const ZERO_WIDTH_CODEPOINTS = new Set([0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x2060, 0xfeff]);
 
+/**
+ * Strip ANSI escape sequences so width calculations only consider printable characters.
+ */
 function stripAnsi(value = "") {
   return String(value).replace(ANSI_REGEX, "");
 }
 
+/**
+ * Determine whether a code point should be treated as full-width (occupying two columns).
+ * The ranges follow Unicode East Asian Width plus emoji blocks we render as wide.
+ */
 function isFullWidthCodePoint(codePoint = 0) {
   return (
     (codePoint >= 0x1100 && codePoint <= 0x115f) ||
@@ -113,6 +121,10 @@ function isFullWidthCodePoint(codePoint = 0) {
   );
 }
 
+/**
+ * Combining marks and variation selectors that overlay previous glyphs.
+ * They should not add additional display width.
+ */
 function isCombiningMark(codePoint = 0) {
   return (
     (codePoint >= 0x0300 && codePoint <= 0x036f) ||
@@ -124,6 +136,9 @@ function isCombiningMark(codePoint = 0) {
   );
 }
 
+/**
+ * Calculate printable width contribution for a single code point.
+ */
 function getCodePointWidth(codePoint = 0) {
   if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) return 0;
   if (ZERO_WIDTH_CODEPOINTS.has(codePoint)) return 0;
@@ -131,6 +146,10 @@ function getCodePointWidth(codePoint = 0) {
   return isFullWidthCodePoint(codePoint) ? 2 : 1;
 }
 
+/**
+ * Calculate the display width of a string, taking ANSI escapes, emoji, and
+ * combining marks into account.
+ */
 function getDisplayWidth(input = "") {
   const clean = stripAnsi(input);
   let width = 0;
@@ -143,6 +162,10 @@ function getDisplayWidth(input = "") {
   return width;
 }
 
+/**
+ * Truncate a string to a target display width using an ellipsis prefix while
+ * preserving the end of the string (e.g., a file path).
+ */
 function truncateDisplayWidth(input = "", maxWidth = 40, ellipsis = "...") {
   const text = stripAnsi(String(input));
   if (getDisplayWidth(text) <= maxWidth) return text;
