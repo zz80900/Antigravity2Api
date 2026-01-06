@@ -87,7 +87,8 @@ function generateRequestId() {
   return `REQ-${Date.now().toString(36)}-${(++requestCounter).toString(36).padStart(4, "0")}`.toUpperCase();
 }
 
-const ANSI_REGEX = /\x1B\[[0-?]*[ -/]*[@-~]/g;
+const ANSI_REGEX =
+  /[\u001B\u009B][[\]()#;?]*(?:(?:;[-a-zA-Z\d/#&.:=?%@~_]*)?\u0007|(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-ntqry=><~])/g;
 // Zero-width code points that should not contribute to printed width
 const ZERO_WIDTH_CODEPOINTS = new Set([0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x2060, 0xfeff]);
 
@@ -393,7 +394,7 @@ const server = http.createServer(async (req, res) => {
 
   server.listen(PORT, HOST, () => {
     const separator = Box.horizontal.repeat(56);
-    const innerWidth = separator.length;
+    const innerWidth = getDisplayWidth(separator);
     const formatBoxLine = (text = "") => {
       const visibleWidth = getDisplayWidth(text);
       const padding = Math.max(0, innerWidth - visibleWidth - 2);
