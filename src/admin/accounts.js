@@ -65,7 +65,15 @@ async function getAccountQuota(authManager, fileName, upstreamClient) {
         let reset = "-";
         if (quota.resetTime) {
             try {
-                reset = new Date(quota.resetTime).toLocaleString();
+                const d = new Date(quota.resetTime);
+                // Format: yyyy-MM-dd HH:mm:ss (server local time)
+                const yyyy = d.getFullYear();
+                const MM = String(d.getMonth() + 1).padStart(2, "0");
+                const dd = String(d.getDate()).padStart(2, "0");
+                const HH = String(d.getHours()).padStart(2, "0");
+                const mm = String(d.getMinutes()).padStart(2, "0");
+                const ss = String(d.getSeconds()).padStart(2, "0");
+                reset = `${yyyy}-${MM}-${dd} ${HH}:${mm}:${ss}`;
             } catch(e) {}
         }
 
