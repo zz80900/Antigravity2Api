@@ -2,6 +2,20 @@ const path = require("path");
 
 const httpClient = require("../auth/httpClient");
 
+function parseEnvNonNegativeInt(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null) return fallback;
+  const n = Number.parseInt(String(raw).trim(), 10);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return n;
+}
+
+// Fixed delay used for:
+// - network error retry
+// - 429 without retryDelay (and after account rotation)
+// - 429 with retryDelay > 5000ms (after rotation)
+const FIXED_RETRY_DELAY_MS = parseEnvNonNegativeInt("AG2API_RETRY_DELAY_MS", 1200);
+
 const KNOWN_LOG_LEVELS = new Set([
   "debug",
   "info",
@@ -211,7 +225,7 @@ class UpstreamClient {
 
       const accountName = creds?.account?.filePath ? path.basename(creds.account.filePath) : "unknown-account";
       const requestBody = buildBody(creds.projectId);
-      const startTime = Date.now();
+      let startTime = Date.now();
 
       this.logUpstream(`发送请求`, {
         method,
@@ -242,21 +256,59 @@ class UpstreamClient {
           },
         });
 
-        // Network/transport error: rotate and try next account.
-        lastResponse = null;
-        
-        this.logRetry("网络错误，轮换账户", {
+        // Network/transport error: wait a bit then retry once on the same account.
+        this.logRetry("网络错误，等待重试", {
           attempt: attemptNum,
           maxAttempts,
+          delayMs: FIXED_RETRY_DELAY_MS,
           account: accountName,
           error: netErr.message || netErr,
-          nextAction: "轮换到下一个账户",
+          nextAction: "同账户重试",
         });
 
-        if (this.auth && typeof this.auth.rotateAccount === "function") {
-          this.auth.rotateAccount(quotaGroup);
+        await this.sleep(FIXED_RETRY_DELAY_MS);
+
+        // Retry once on the same account with the same request body.
+        startTime = Date.now();
+        try {
+          response = await httpClient.callV1Internal(method, creds.accessToken, requestBody, {
+            queryString,
+            headers,
+            limiter: this.auth.apiLimiter,
+          });
+        } catch (netErr2) {
+          const retryDuration = Date.now() - startTime;
+          this.logError(`重试时网络错误`, netErr2, {
+            context: {
+              method: `v1internal:${method}`,
+              group: quotaGroup,
+              account: accountName,
+              attempt: attemptNum,
+              maxAttempts,
+              duration: retryDuration,
+            },
+          });
+
+          // Retry still failed: rotate and try next account.
+          lastResponse = null;
+
+          this.logRetry("网络错误，轮换账户", {
+            attempt: attemptNum,
+            maxAttempts,
+            delayMs: FIXED_RETRY_DELAY_MS,
+            account: accountName,
+            error: netErr2.message || netErr2,
+            nextAction: "轮换到下一个账户",
+          });
+
+          if (this.auth && typeof this.auth.rotateAccount === "function") {
+            this.auth.rotateAccount(quotaGroup);
+          }
+          if (attemptNum < maxAttempts) {
+            await this.sleep(FIXED_RETRY_DELAY_MS);
+          }
+          continue;
         }
-        continue;
       }
 
       const duration = Date.now() - startTime;
@@ -306,7 +358,7 @@ class UpstreamClient {
       } catch (_) {}
 
       const errorDetails = this.parseErrorDetails(errorText);
-      const retryMs = this.parseRetryDelayMs(errorText);
+      let retryMs = this.parseRetryDelayMs(errorText);
 
       this.logQuota(`收到 429 限流响应`, {
         account: accountName,
@@ -316,7 +368,190 @@ class UpstreamClient {
 
       this.log("error", `🚫 Google API 429 错误详情`, errorDetails);
 
-      if (retryMs != null && retryMs <= 5000) {
+      if (retryMs == null) {
+        const delay = FIXED_RETRY_DELAY_MS;
+
+        this.logRetry("429 无重试信息，等待重试", {
+          attempt: attemptNum,
+          maxAttempts,
+          delayMs: delay,
+          account: accountName,
+          nextAction: "同账户重试",
+        });
+
+        await this.sleep(delay);
+
+        // Retry once on the same account with the same request body.
+        const retryStartTime = Date.now();
+        let retryResp;
+        try {
+          retryResp = await httpClient.callV1Internal(method, creds.accessToken, requestBody, {
+            queryString,
+            headers,
+            limiter: this.auth.apiLimiter,
+          });
+        } catch (netErr2) {
+          const retryDuration = Date.now() - retryStartTime;
+          this.logError(`重试时网络错误`, netErr2, {
+            context: {
+              method: `v1internal:${method}`,
+              group: quotaGroup,
+              account: accountName,
+              attempt: attemptNum,
+              duration: retryDuration,
+            },
+          });
+
+          this.logRetry("重试失败，轮换账户", {
+            attempt: attemptNum,
+            maxAttempts,
+            delayMs: FIXED_RETRY_DELAY_MS,
+            account: accountName,
+            error: netErr2.message || netErr2,
+            nextAction: "轮换到下一个账户",
+          });
+
+          if (this.auth && typeof this.auth.rotateAccount === "function") {
+            this.auth.rotateAccount(quotaGroup);
+          }
+          if (attemptNum < maxAttempts) {
+            await this.sleep(FIXED_RETRY_DELAY_MS);
+          }
+          continue;
+        }
+
+        const retryDuration = Date.now() - retryStartTime;
+
+        if (retryResp.ok) {
+          this.logUpstream(`重试成功`, {
+            method,
+            account: accountName,
+            group: quotaGroup,
+            attempt: attemptNum,
+            maxAttempts,
+            status: retryResp.status,
+            duration: retryDuration,
+          });
+          return retryResp;
+        }
+
+        if (retryResp.status !== 429) {
+          this.logUpstream(`重试返回非 429 错误`, {
+            method,
+            account: accountName,
+            group: quotaGroup,
+            attempt: attemptNum,
+            maxAttempts,
+            status: retryResp.status,
+            duration: retryDuration,
+          });
+          return retryResp;
+        }
+
+        lastResponse = retryResp;
+
+        // Still 429: if retryMs still missing, or retryMs > 5000ms, rotate.
+        let retryErrorText = "";
+        try {
+          retryErrorText = await retryResp.clone().text();
+        } catch (_) {}
+        const retryDetails = this.parseErrorDetails(retryErrorText);
+        const retryMs2 = this.parseRetryDelayMs(retryErrorText);
+
+        this.logQuota(`重试后仍然 429`, {
+          account: accountName,
+          group: quotaGroup,
+          resetDelay: retryMs2,
+        });
+
+        this.log("error", `🚫 Google API 429 错误详情 (重试)`, retryDetails);
+
+        if (retryMs2 != null && retryMs2 <= 5000) {
+          // Honor upstream short retry delay once.
+          const delay2 = Math.max(0, retryMs2 + 200);
+
+          this.logRetry("短时间限流，等待重试", {
+            attempt: attemptNum,
+            maxAttempts,
+            delayMs: delay2,
+            account: accountName,
+            nextAction: "同账户重试",
+          });
+
+          await this.sleep(delay2);
+
+          const retry2StartTime = Date.now();
+          let retry2Resp;
+          try {
+            retry2Resp = await httpClient.callV1Internal(method, creds.accessToken, requestBody, {
+              queryString,
+              headers,
+              limiter: this.auth.apiLimiter,
+            });
+          } catch (netErr3) {
+            const retry2Duration = Date.now() - retry2StartTime;
+            this.logError(`重试时网络错误`, netErr3, {
+              context: {
+                method: `v1internal:${method}`,
+                group: quotaGroup,
+                account: accountName,
+                attempt: attemptNum,
+                duration: retry2Duration,
+              },
+            });
+
+            this.logRetry("重试失败，轮换账户", {
+              attempt: attemptNum,
+              maxAttempts,
+              delayMs: FIXED_RETRY_DELAY_MS,
+              account: accountName,
+              error: netErr3.message || netErr3,
+              nextAction: "轮换到下一个账户",
+            });
+
+            if (this.auth && typeof this.auth.rotateAccount === "function") {
+              this.auth.rotateAccount(quotaGroup);
+            }
+            if (attemptNum < maxAttempts) {
+              await this.sleep(FIXED_RETRY_DELAY_MS);
+            }
+            continue;
+          }
+
+          const retry2Duration = Date.now() - retry2StartTime;
+
+          if (retry2Resp.ok) {
+            this.logUpstream(`重试成功`, {
+              method,
+              account: accountName,
+              group: quotaGroup,
+              attempt: attemptNum,
+              maxAttempts,
+              status: retry2Resp.status,
+              duration: retry2Duration,
+            });
+            return retry2Resp;
+          }
+
+          if (retry2Resp.status !== 429) {
+            this.logUpstream(`重试返回非 429 错误`, {
+              method,
+              account: accountName,
+              group: quotaGroup,
+              attempt: attemptNum,
+              maxAttempts,
+              status: retry2Resp.status,
+              duration: retry2Duration,
+            });
+            return retry2Resp;
+          }
+
+          lastResponse = retry2Resp;
+          retryMs = retryMs2;
+        } else {
+          retryMs = retryMs2;
+        }
+      } else if (retryMs != null && retryMs <= 5000) {
         const delay = Math.max(0, retryMs + 200);
         
         this.logRetry("短时间限流，等待重试", {
@@ -353,6 +588,7 @@ class UpstreamClient {
           this.logRetry("重试失败，轮换账户", {
             attempt: attemptNum,
             maxAttempts,
+            delayMs: FIXED_RETRY_DELAY_MS,
             account: accountName,
             error: netErr2.message || netErr2,
             nextAction: "轮换到下一个账户",
@@ -360,6 +596,9 @@ class UpstreamClient {
 
           if (this.auth && typeof this.auth.rotateAccount === "function") {
             this.auth.rotateAccount(quotaGroup);
+          }
+          if (attemptNum < maxAttempts) {
+            await this.sleep(FIXED_RETRY_DELAY_MS);
           }
           continue;
         }
@@ -411,6 +650,9 @@ class UpstreamClient {
 
       if (this.auth && typeof this.auth.rotateAccount === "function") {
         this.auth.rotateAccount(quotaGroup);
+      }
+      if (attemptNum < maxAttempts) {
+        await this.sleep(FIXED_RETRY_DELAY_MS);
       }
     }
 
