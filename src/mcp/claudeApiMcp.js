@@ -164,12 +164,79 @@ async function readStreamToString(stream) {
   return out;
 }
 
+async function readStreamToStringAndChunks(stream) {
+  if (!stream || typeof stream.getReader !== "function") return { text: "", chunks: [], delaysMs: [] };
+
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+
+  let text = "";
+  const chunks = [];
+  const delaysMs = [];
+  let lastChunkAt = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    const now = Date.now();
+    delaysMs.push(lastChunkAt == null ? 0 : Math.max(0, now - lastChunkAt));
+    lastChunkAt = now;
+    const src = value instanceof Uint8Array ? value : new Uint8Array(value);
+    const copy = new Uint8Array(src.byteLength);
+    copy.set(src);
+    chunks.push(copy);
+    text += decoder.decode(copy, { stream: true });
+  }
+
+  text += decoder.decode();
+  return { text, chunks, delaysMs };
+}
+
 function streamFromString(text) {
   const encoder = new TextEncoder();
   return new ReadableStream({
     start(controller) {
       controller.enqueue(encoder.encode(text || ""));
       controller.close();
+    },
+  });
+}
+
+function streamFromChunks(chunks) {
+  const list = Array.isArray(chunks) ? chunks : [];
+  let index = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (index >= list.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(list[index++]);
+      if (index >= list.length) controller.close();
+    },
+  });
+}
+
+function streamFromTimedChunks(chunks, delaysMs) {
+  const list = Array.isArray(chunks) ? chunks : [];
+  const delays = Array.isArray(delaysMs) ? delaysMs : [];
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  let canceled = false;
+  return new ReadableStream({
+    async start(controller) {
+      for (let i = 0; i < list.length && !canceled; i++) {
+        const delay = Number.isFinite(delays[i]) ? delays[i] : 0;
+        const waitMs = Math.max(0, Math.round(delay));
+        if (waitMs > 0) await sleep(waitMs);
+        if (canceled) break;
+        controller.enqueue(list[i]);
+      }
+      if (!canceled) controller.close();
+    },
+    cancel() {
+      canceled = true;
     },
   });
 }
@@ -318,13 +385,13 @@ async function bufferForMcpSwitchAndMaybeRetry({
 }) {
   if (!shouldBufferForSwitch || !convertedResponse?.body) return null;
 
-  const buffered = await readStreamToString(convertedResponse.body);
+  const { text: buffered, chunks, delaysMs } = await readStreamToStringAndChunks(convertedResponse.body);
   if (debugRequestResponse && buffered) {
     log("Claude Response Payload (Transformed Stream)", buffered);
   }
 
   if (!hasMcpSwitchSignal(buffered)) {
-    return { finalResponseBody: streamFromString(buffered) };
+    return { finalResponseBody: streamFromTimedChunks(chunks, delaysMs) };
   }
 
   log("info", `MCP switch signal detected; retrying upstream with ${mcpModel}`);
