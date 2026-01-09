@@ -55,7 +55,7 @@ async function callV1Internal(method, accessToken, body, options = {}) {
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${accessToken}`,
-      "User-Agent": "antigravity/ windows/amd64",
+      "User-Agent": "antigravity/ windows/arm64",
       "Accept-Encoding": "gzip",
       ...extraHeaders,
     },
@@ -69,7 +69,7 @@ async function fetchProjectId(accessToken, limiter) {
     method: "POST",
     headers: {
       Host: "daily-cloudcode-pa.sandbox.googleapis.com",
-      "User-Agent": "antigravity/ windows/amd64",
+      "User-Agent": "antigravity/ windows/arm64",
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/json",
       "Accept-Encoding": "gzip",
@@ -100,7 +100,7 @@ async function fetchAvailableModels(accessToken, limiter) {
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${accessToken}`,
-      "User-Agent": "antigravity/ windows/amd64",
+      "User-Agent": "antigravity/ windows/arm64",
     },
     body: JSON.stringify({}),
   });

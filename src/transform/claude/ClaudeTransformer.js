@@ -15,11 +15,28 @@ const { maybeInjectMcpHintIntoSystemText } = require("../../mcp/claudeTransforme
 const fs = require("fs");
 const path = require("path");
 
+function normalizeAntigravitySystemInstructionText(text) {
+  if (typeof text !== "string") return "";
+  // Allow the file to be pasted from JSON logs (single line with literal "\n"/"\t" escapes).
+  if (!text.includes("\n") && text.includes("\\n")) {
+    return text
+      .replace(/\\r\\n/g, "\n")
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t")
+      .replace(/\\r/g, "\r")
+      .replace(/\\\\/g, "\\");
+  }
+  return text;
+}
+
 let antigravitySystemInstructionText = "";
 try {
   antigravitySystemInstructionText = fs.readFileSync(
     path.resolve(__dirname, "antigravity_system_instruction.txt"),
     "utf8"
+  );
+  antigravitySystemInstructionText = normalizeAntigravitySystemInstructionText(
+    antigravitySystemInstructionText
   );
 } catch (_) {}
 
@@ -851,13 +868,28 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
   // otherwise they may respond with 429 RESOURCE_EXHAUSTED even when quota exists.
   const modelNameForSystem = String(claudeReq?.model || "").toLowerCase();
   if (
-    (modelNameForSystem.includes("claude") || modelNameForSystem.includes("gemini-3-pro")) &&
+    (modelNameForSystem.includes("claude") || modelNameForSystem.includes("gemini")) &&
     antigravitySystemInstructionText
   ) {
-    systemInstruction = {
-      role: "user",
-      parts: [{ text: antigravitySystemInstructionText }],
-    };
+    if (systemInstruction && Array.isArray(systemInstruction.parts)) {
+      let replaced = false;
+      for (const part of systemInstruction.parts) {
+        if (typeof part?.text === "string" && part.text.includes("You are Claude Code")) {
+          part.text = antigravitySystemInstructionText;
+          replaced = true;
+        }
+      }
+      // If no Claude Code marker was found, prepend an Antigravity-style instruction.
+      if (!replaced) {
+        systemInstruction.parts.unshift({ text: antigravitySystemInstructionText });
+      }
+      systemInstruction.role = "user";
+    } else {
+      systemInstruction = {
+        role: "user",
+        parts: [{ text: antigravitySystemInstructionText }],
+      };
+    }
   }
 
   // 2. Contents (Messages)
@@ -1084,9 +1116,9 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
     }
   }
 
-  if (claudeReq.temperature !== undefined) {
-    generationConfig.temperature = claudeReq.temperature;
-  }
+  // if (claudeReq.temperature !== undefined) {
+  //   generationConfig.temperature = claudeReq.temperature;
+  // }
   if (claudeReq.top_p !== undefined) {
     generationConfig.topP = claudeReq.top_p;
   }

@@ -2,11 +2,28 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
+function normalizeAntigravitySystemInstructionText(text) {
+  if (typeof text !== "string") return "";
+  // Allow the file to be pasted from JSON logs (single line with literal "\n"/"\t" escapes).
+  if (!text.includes("\n") && text.includes("\\n")) {
+    return text
+      .replace(/\\r\\n/g, "\n")
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t")
+      .replace(/\\r/g, "\r")
+      .replace(/\\\\/g, "\\");
+  }
+  return text;
+}
+
 let antigravitySystemInstructionText = "";
 try {
   antigravitySystemInstructionText = fs.readFileSync(
     path.resolve(__dirname, "../claude/antigravity_system_instruction.txt"),
     "utf8"
+  );
+  antigravitySystemInstructionText = normalizeAntigravitySystemInstructionText(
+    antigravitySystemInstructionText
   );
 } catch (_) {}
 
@@ -196,6 +213,7 @@ function wrapRequest(clientJson, options) {
     (modelNameForSystem.includes("claude") || modelNameForSystem.includes("gemini-3-pro")) &&
     antigravitySystemInstructionText
   ) {
+    // Directly replace the entire systemInstruction with antigravity content
     innerRequest.systemInstruction = {
       role: "user",
       parts: [{ text: antigravitySystemInstructionText }],

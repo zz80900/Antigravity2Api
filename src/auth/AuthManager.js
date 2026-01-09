@@ -88,8 +88,8 @@ class AuthManager {
     // Claude/Gemini quotas are independent; keep rotation state per group.
     this.currentAccountIndexByGroup = { claude: 0, gemini: 0 };
     this.logger = options.logger || null;
-    // Ensure v1internal requests are spaced >= 500ms.
-    this.apiLimiter = options.rateLimiter || new RateLimiter(500);
+    // Ensure v1internal requests are spaced >= 1 * 1000ms.
+    this.apiLimiter = options.rateLimiter || new RateLimiter(1 * 1000);
     this.lastLoadCodeAssistBody = null;
 
     this.tokenRefresher = new TokenRefresher({
