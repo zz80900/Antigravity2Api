@@ -228,7 +228,7 @@ function streamFromTimedChunks(chunks, delaysMs) {
     async start(controller) {
       for (let i = 0; i < list.length && !canceled; i++) {
         const delay = Number.isFinite(delays[i]) ? delays[i] : 0;
-        const waitMs = Math.max(0, Math.round(delay));
+        const waitMs = Math.max(0, Math.round(delay * 0.5));
         if (waitMs > 0) await sleep(waitMs);
         if (canceled) break;
         controller.enqueue(list[i]);

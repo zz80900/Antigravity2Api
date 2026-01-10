@@ -3,7 +3,7 @@ const { wrapRequest, unwrapResponse, createUnwrapStream } = require("../transfor
 function isGemini3ModelName(modelName) {
   return String(modelName || "")
     .toLowerCase()
-    .includes("gemini-3");
+    .includes("gemini-3-pro");
 }
 
 function ensureAltSse(queryString) {
