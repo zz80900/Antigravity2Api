@@ -398,13 +398,13 @@ class PartProcessor {
             index: this.state.blockIndex
           });
           this.state.blockIndex++;
-	        } else {
-	          this.processTextWithMcpXml(part.text);
-	        }
-	      }
-	      return;
-	    }
-	  }
+        } else {
+          this.processTextWithMcpXml(part.text);
+        }
+      }
+      return;
+    }
+  }
   
   // 处理 thinking 内容（签名由调用方在 process() 中处理）
   processThinking(text) {
@@ -502,20 +502,20 @@ class NonStreamingProcessor {
     // 非流式可一次性预扫，确保“本次响应是否启用 thinking”判断不会被顺序影响
     this.hasThinking = parts.some((p) => p?.thought);
     
-	    for (const part of parts) {
-	      this.processPart(part);
-	    }
+    for (const part of parts) {
+      this.processPart(part);
+    }
 
-	    if (this.mcpXmlParser) {
-	      const rest = this.mcpXmlParser.flush();
-	      for (const seg of rest) {
-	        if (seg?.type === "text" && seg.text) this.textBuilder += seg.text;
-	      }
-	    }
-	    
-	    // 刷新剩余内容（按原始顺序）
-	    this.flushThinking();
-	    this.flushText();
+    if (this.mcpXmlParser) {
+      const rest = this.mcpXmlParser.flush();
+      for (const seg of rest) {
+        if (seg?.type === "text" && seg.text) this.textBuilder += seg.text;
+      }
+    }
+    
+    // 刷新剩余内容（按原始顺序）
+    this.flushThinking();
+    this.flushText();
     
     // 处理空普通文本带签名的场景（PDF 776-778）
     // 签名在最后一个 part，但那是空文本，需要输出空 thinking 块承载签名
@@ -635,25 +635,25 @@ class NonStreamingProcessor {
           this.trailingSignature = null;
         }
         
-	        if (this.mcpXmlParser && !signature) {
-	          const segments = this.mcpXmlParser.pushText(part.text);
-	          for (const seg of segments) {
-	            if (seg?.type === "tool" && seg.name) {
-	              this.flushText();
-	              this.hasToolCall = true;
-	              this.contentBlocks.push({
-	                type: "tool_use",
-	                id: makeToolUseId(),
-	                name: seg.name,
-	                input: seg.input || {},
-	              });
-	            } else if (seg?.type === "text" && seg.text) {
-	              this.textBuilder += seg.text;
-	            }
-	          }
-	        } else {
-	          this.textBuilder += part.text;
-	        }
+        if (this.mcpXmlParser && !signature) {
+          const segments = this.mcpXmlParser.pushText(part.text);
+          for (const seg of segments) {
+            if (seg?.type === "tool" && seg.name) {
+              this.flushText();
+              this.hasToolCall = true;
+              this.contentBlocks.push({
+                type: "tool_use",
+                id: makeToolUseId(),
+                name: seg.name,
+                input: seg.input || {},
+              });
+            } else if (seg?.type === "text" && seg.text) {
+              this.textBuilder += seg.text;
+            }
+          }
+        } else {
+          this.textBuilder += part.text;
+        }
         
         // 非空 text 带签名：仅在本次响应里出现过 thinking 时才输出空 thinking 块承载签名；
         // 否则丢弃该签名，保持响应结构与官方一致（纯 text/tool_use）。
@@ -902,12 +902,12 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
   // 需要 crypto 模块生成 requestId
   const crypto = require("crypto");
   
-	  const hasWebSearchTool =
-	    Array.isArray(claudeReq.tools) &&
-	    claudeReq.tools.some((tool) => tool?.name === "web_search");
+  const hasWebSearchTool =
+    Array.isArray(claudeReq.tools) &&
+    claudeReq.tools.some((tool) => tool?.name === "web_search");
 
-	  const isClaudeModel = String(mapClaudeModelToGemini(claudeReq.model)).startsWith("claude");
-	  const mcpXmlEnabled = isMcpXmlEnabled() && getMcpTools(claudeReq?.tools).length > 0;
+  const isClaudeModel = String(mapClaudeModelToGemini(claudeReq.model)).startsWith("claude");
+  const mcpXmlEnabled = isMcpXmlEnabled() && getMcpTools(claudeReq?.tools).length > 0;
 
   // thoughtSignature（Thought Signatures 协议）：
   // - 同模型链路（Claude↔Claude / Gemini↔Gemini）必须原样转发，否则会出现签名缺失/不匹配导致 400。
@@ -927,23 +927,23 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
     let injectedMcpHintIntoSystem = false;
     if (Array.isArray(claudeReq.system)) {
       for (const item of claudeReq.system) {
-	        if (item && item.type === "text") {
-	          let text = item.text || "";
-	          if (!mcpXmlEnabled) {
-	            const injectedResult = maybeInjectMcpHintIntoSystemText({
-	              text,
-	              claudeReq,
-	              isClaudeModel,
-	              injected: injectedMcpHintIntoSystem,
-	            });
-	            text = injectedResult.text;
-	            injectedMcpHintIntoSystem = injectedResult.injected;
-	          }
-	          systemParts.push({ text });
-	        }
-	      }
-	    } else if (typeof claudeReq.system === "string") {
-	      systemParts.push({ text: claudeReq.system });
+        if (item && item.type === "text") {
+          let text = item.text || "";
+          if (!mcpXmlEnabled) {
+            const injectedResult = maybeInjectMcpHintIntoSystemText({
+              text,
+              claudeReq,
+              isClaudeModel,
+              injected: injectedMcpHintIntoSystem,
+            });
+            text = injectedResult.text;
+            injectedMcpHintIntoSystem = injectedResult.injected;
+          }
+          systemParts.push({ text });
+        }
+      }
+    } else if (typeof claudeReq.system === "string") {
+      systemParts.push({ text: claudeReq.system });
     }
 
     if (systemParts.length > 0) {
@@ -957,10 +957,10 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
   // Some upstream models (e.g. claude-*, gemini-3-pro*) require an Antigravity-style systemInstruction,
   // otherwise they may respond with 429 RESOURCE_EXHAUSTED even when quota exists.
   const modelNameForSystem = String(claudeReq?.model || "").toLowerCase();
-	  if (
-	    (modelNameForSystem.includes("claude") || modelNameForSystem.includes("gemini")) &&
-	    antigravitySystemInstructionText
-	  ) {
+  if (
+    (modelNameForSystem.includes("claude") || modelNameForSystem.includes("gemini")) &&
+    antigravitySystemInstructionText
+  ) {
     if (systemInstruction && Array.isArray(systemInstruction.parts)) {
       let replaced = false;
       for (const part of systemInstruction.parts) {
@@ -980,20 +980,20 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
         parts: [{ text: antigravitySystemInstructionText }],
       };
     }
-	  }
+  }
 
-	  // MCP XML 方案：仅针对 mcp__* 工具，注入 XML 调用协议提示词（只影响上游）
-	  if (mcpXmlEnabled) {
-	    const mcpTools = getMcpTools(claudeReq?.tools);
-	    const mcpXmlPrompt = buildMcpXmlSystemPrompt(mcpTools);
-	    if (mcpXmlPrompt) {
-	      if (systemInstruction && Array.isArray(systemInstruction.parts)) {
-	        systemInstruction.parts.push({ text: mcpXmlPrompt });
-	      } else {
-	        systemInstruction = { role: "user", parts: [{ text: mcpXmlPrompt }] };
-	      }
-	    }
-	  }
+  // MCP XML 方案：仅针对 mcp__* 工具，注入 XML 调用协议提示词（只影响上游）
+  if (mcpXmlEnabled) {
+    const mcpTools = getMcpTools(claudeReq?.tools);
+    const mcpXmlPrompt = buildMcpXmlSystemPrompt(mcpTools);
+    if (mcpXmlPrompt) {
+      if (systemInstruction && Array.isArray(systemInstruction.parts)) {
+        systemInstruction.parts.push({ text: mcpXmlPrompt });
+      } else {
+        systemInstruction = { role: "user", parts: [{ text: mcpXmlPrompt }] };
+      }
+    }
+  }
 
   // 2. Contents (Messages)
   const contents = [];
@@ -1100,20 +1100,20 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
               sawNonThinkingContent = true;
             }
             previousWasToolResult = false;
-	          } else if (item.type === "tool_use") {
-	            if (mcpXmlEnabled && isMcpToolName(item?.name)) {
-	              if (item.id && item.name) {
-	                toolIdToName.set(item.id, item.name);
-	              }
-	              clientContent.parts.push({ text: buildMcpToolCallXml(item.name, item.input || {}) });
-	              sawNonThinkingContent = true;
-	              previousWasToolResult = false;
-	              continue;
-	            }
-	            // 根据官方文档：签名必须在收到签名的那个 functionCall part 上原样返回
-	            const fcPart = {
-	              functionCall: {
-	                name: item.name,
+          } else if (item.type === "tool_use") {
+            if (mcpXmlEnabled && isMcpToolName(item?.name)) {
+              if (item.id && item.name) {
+                toolIdToName.set(item.id, item.name);
+              }
+              clientContent.parts.push({ text: buildMcpToolCallXml(item.name, item.input || {}) });
+              sawNonThinkingContent = true;
+              previousWasToolResult = false;
+              continue;
+            }
+            // 根据官方文档：签名必须在收到签名的那个 functionCall part 上原样返回
+            const fcPart = {
+              functionCall: {
+                name: item.name,
                 args: item.input || {},
                 id: item.id,
               },
@@ -1130,41 +1130,49 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
                 console.log(`[ThoughtSignature] injected tool_use.id=${item.id}`);
               }
             }
-	            clientContent.parts.push(fcPart);
-	            sawNonThinkingContent = true;
-	            previousWasToolResult = false;
-	          } else if (item.type === "tool_result") {
-	            // 优先用先前记录的 tool_use id -> name 映射，还原原始函数名
-	            let funcName = toolIdToName.get(item.tool_use_id) || item.tool_use_id;
-	            
-	            let content = item.content || "";
-	            if (Array.isArray(content)) {
-	              content = content.map(c => c.text || JSON.stringify(c)).join("\n");
-	            }
+            clientContent.parts.push(fcPart);
+            sawNonThinkingContent = true;
+            previousWasToolResult = false;
+          } else if (item.type === "tool_result") {
+            // 优先用先前记录的 tool_use id -> name 映射，还原原始函数名
+            let funcName = toolIdToName.get(item.tool_use_id) || item.tool_use_id;
+            
+            const rawContent = item.content;
+            let contentText = rawContent || "";
+            if (Array.isArray(contentText)) {
+              contentText = contentText.map(c => c?.text || JSON.stringify(c)).join("\n");
+            }
+            const isError = item.is_error === true;
 
-	            if (mcpXmlEnabled && isMcpToolName(funcName)) {
-	              clientContent.parts.push({
-	                text: buildMcpToolResultXml(funcName, item.tool_use_id, content),
-	              });
-	            } else if (mcpXmlEnabled && funcName === item.tool_use_id) {
-	              // Best-effort fallback: unknown tool name, but still wrap as MCP result text.
-	              clientContent.parts.push({
-	                text: buildMcpToolResultXml("", item.tool_use_id, content),
-	              });
-	            } else {
-	              clientContent.parts.push({
-	                functionResponse: {
-	                  name: funcName,
-	                  response: { result: content },
-	                  id: item.tool_use_id,
-	                },
-	              });
-	            }
-	            sawNonThinkingContent = true;
-	            previousWasToolResult = true;
-	          }
-	        }
-	      } else if (typeof msg.content === "string") {
+            if (mcpXmlEnabled && isMcpToolName(funcName)) {
+              clientContent.parts.push({
+                text: buildMcpToolResultXml(funcName, item.tool_use_id, contentText, {
+                  is_error: isError,
+                  content: rawContent,
+                }),
+              });
+            } else if (mcpXmlEnabled && funcName === item.tool_use_id) {
+              // Best-effort fallback: unknown tool name, but still wrap as MCP result text.
+              clientContent.parts.push({
+                text: buildMcpToolResultXml("", item.tool_use_id, contentText, {
+                  is_error: isError,
+                  content: rawContent,
+                }),
+              });
+            } else {
+              clientContent.parts.push({
+                functionResponse: {
+                  name: funcName,
+                  response: { result: contentText, is_error: isError, content: rawContent },
+                  id: item.tool_use_id,
+                },
+              });
+            }
+            sawNonThinkingContent = true;
+            previousWasToolResult = true;
+          }
+        }
+      } else if (typeof msg.content === "string") {
         const text = msg.content;
         if (text) {
           clientContent.parts.push({ text });
@@ -1564,16 +1572,16 @@ async function handleStreamingResponse(response, options = {}) {
   const encoder = new TextEncoder();
   
   const stream = new ReadableStream({
-	    async start(controller) {
-	      const state = new StreamingState(encoder, controller);
-	      if (options?.overrideModel) state.overrideModel = options.overrideModel;
-	      const mcpXmlToolNames = Array.isArray(options?.mcpXmlToolNames) ? options.mcpXmlToolNames : [];
-	      if (isMcpXmlEnabled() && mcpXmlToolNames.length > 0) {
-	        state.mcpXmlParser = createMcpXmlStreamParser(mcpXmlToolNames);
-	      }
-	      const processor = new PartProcessor(state);
-	      
-	      try {
+    async start(controller) {
+      const state = new StreamingState(encoder, controller);
+      if (options?.overrideModel) state.overrideModel = options.overrideModel;
+      const mcpXmlToolNames = Array.isArray(options?.mcpXmlToolNames) ? options.mcpXmlToolNames : [];
+      if (isMcpXmlEnabled() && mcpXmlToolNames.length > 0) {
+        state.mcpXmlParser = createMcpXmlStreamParser(mcpXmlToolNames);
+      }
+      const processor = new PartProcessor(state);
+      
+      try {
         let buffer = "";
         
         while (true) {
@@ -1684,18 +1692,18 @@ async function processSSELine(line, state, processor) {
     }
     
     // 检查是否结束
-	    const finishReason = candidate?.finishReason;
-	    if (finishReason) {
-	      if (!state.webSearchMode) {
-	        if (state.mcpXmlParser) {
-	          const rest = state.mcpXmlParser.flush();
-	          for (const seg of rest) {
-	            if (seg?.type === "text" && seg.text) processor.processText(seg.text);
-	          }
-	        }
-	        state.emitFinish(finishReason, rawJSON.usageMetadata);
-	        return;
-	      }
+    const finishReason = candidate?.finishReason;
+    if (finishReason) {
+      if (!state.webSearchMode) {
+        if (state.mcpXmlParser) {
+          const rest = state.mcpXmlParser.flush();
+          for (const seg of rest) {
+            if (seg?.type === "text" && seg.text) processor.processText(seg.text);
+          }
+        }
+        state.emitFinish(finishReason, rawJSON.usageMetadata);
+        return;
+      }
 
       // web_search：在 message_delta 前补齐 server_tool_use / tool_result / citations / 最终文本
       await resolveWebSearchRedirectUrls(state.webSearch);

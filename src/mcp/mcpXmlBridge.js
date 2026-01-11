@@ -22,14 +22,136 @@ function getMcpToolNames(tools) {
     .filter((n) => typeof n === "string" && n);
 }
 
-function safeJsonStringify(value, maxLen = 8000) {
+function safeJsonStringify(value) {
   try {
-    const text = JSON.stringify(value);
-    if (typeof text === "string" && text.length > maxLen) return text.slice(0, maxLen) + "...";
-    return text;
+    return JSON.stringify(value, (_, v) => (typeof v === "bigint" ? v.toString() : v));
   } catch (_) {
     return "";
   }
+}
+
+function escapeRegExp(input) {
+  return String(input || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function decodeXmlEntities(input) {
+  const text = String(input ?? "");
+  if (!text.includes("&")) return text;
+  return text.replace(/&(#x?[0-9a-fA-F]+|lt|gt|amp|quot|apos);/g, (m, entity) => {
+    switch (entity) {
+      case "lt":
+        return "<";
+      case "gt":
+        return ">";
+      case "amp":
+        return "&";
+      case "quot":
+        return "\"";
+      case "apos":
+        return "'";
+      default:
+        break;
+    }
+
+    if (entity[0] === "#") {
+      const isHex = entity[1] === "x" || entity[1] === "X";
+      const raw = isHex ? entity.slice(2) : entity.slice(1);
+      const base = isHex ? 16 : 10;
+      const codePoint = Number.parseInt(raw, base);
+      if (!Number.isFinite(codePoint)) return m;
+      try {
+        return String.fromCodePoint(codePoint);
+      } catch (_) {
+        return m;
+      }
+    }
+    return m;
+  });
+}
+
+function parseXmlAttributes(attrText) {
+  const src = String(attrText || "");
+  const attrs = {};
+  let i = 0;
+
+  function skipWs() {
+    while (i < src.length && /\s/.test(src[i])) i++;
+  }
+
+  function readName() {
+    const start = i;
+    while (i < src.length && /[A-Za-z0-9_:.\\-]/.test(src[i])) i++;
+    return src.slice(start, i);
+  }
+
+  function readValue() {
+    skipWs();
+    if (i >= src.length) return "";
+    const ch = src[i];
+    if (ch === "\"" || ch === "'") {
+      const quote = ch;
+      i++;
+      const start = i;
+      while (i < src.length) {
+        if (src[i] === quote) {
+          // Tolerate backslash-escaped quotes (even though it's not standard XML),
+          // because some upstream models emit values like: attr="say \"hello\"".
+          let bs = 0;
+          let j = i - 1;
+          while (j >= start && src[j] === "\\") {
+            bs++;
+            j--;
+          }
+          if (bs % 2 === 0) break;
+        }
+        i++;
+      }
+      const val = src.slice(start, i);
+      if (i < src.length && src[i] === quote) i++;
+      return val;
+    }
+    const start = i;
+    while (i < src.length && !/\s/.test(src[i])) i++;
+    return src.slice(start, i);
+  }
+
+  while (i < src.length) {
+    skipWs();
+    if (i >= src.length) break;
+    const name = readName();
+    if (!name) break;
+    skipWs();
+    if (src[i] !== "=") {
+      attrs[name] = true;
+      continue;
+    }
+    i++;
+    const rawVal = readValue();
+    const decoded = decodeXmlEntities(rawVal);
+    const trimmed = decoded.trim();
+    if (trimmed === "true" || trimmed === "false" || trimmed === "null") {
+      attrs[name] = JSON.parse(trimmed);
+      continue;
+    }
+    if (/^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$/.test(trimmed)) {
+      attrs[name] = Number(trimmed);
+      continue;
+    }
+    if (
+      (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]"))
+    ) {
+      try {
+        attrs[name] = JSON.parse(trimmed);
+        continue;
+      } catch (_) {
+        // fallthrough
+      }
+    }
+    attrs[name] = decoded;
+  }
+
+  return attrs;
 }
 
 function buildMcpXmlSystemPrompt(mcpTools) {
@@ -47,7 +169,11 @@ function buildMcpXmlSystemPrompt(mcpTools) {
   lines.push("<mcp__server__tool>{\"arg\":\"value\"}</mcp__server__tool>");
   lines.push("");
   lines.push("工具执行完成后，我会把结果以如下 XML 返回给你：");
-  lines.push("<mcp_tool_result>{\"name\":\"mcp__server__tool\",\"tool_use_id\":\"toolu_xxx\",\"result\":\"...\"}</mcp_tool_result>");
+  lines.push(
+    "<mcp_tool_result>{\"name\":\"mcp__server__tool\",\"tool_use_id\":\"toolu_xxx\",\"result\":\"...\",\"is_error\":false}</mcp_tool_result>",
+  );
+  lines.push("");
+  lines.push("当 is_error 为 true 时，表示该工具执行失败，result 内容为错误信息。");
   lines.push("");
   lines.push("对于非 `mcp__*` 工具：继续使用正常的工具调用机制。");
   lines.push("");
@@ -60,7 +186,7 @@ function buildMcpXmlSystemPrompt(mcpTools) {
     const schema = tool?.input_schema || tool?.inputSchema || null;
     lines.push(`- ${name}${desc ? `: ${desc}` : ""}`);
     if (schema) {
-      lines.push(`  input_schema: ${safeJsonStringify(schema, 4000)}`);
+      lines.push(`  input_schema: ${safeJsonStringify(schema)}`);
     }
   }
 
@@ -69,17 +195,22 @@ function buildMcpXmlSystemPrompt(mcpTools) {
 
 function buildMcpToolCallXml(name, input) {
   const toolName = String(name || "");
-  const payload = safeJsonStringify(input ?? {}, 20000) || "{}";
+  const payload = safeJsonStringify(input ?? {}) || "{}";
   return `<${toolName}>${payload}</${toolName}>`;
 }
 
-function buildMcpToolResultXml(toolName, toolUseId, resultText) {
+function buildMcpToolResultXml(toolName, toolUseId, resultText, extra) {
   const payload = {
     name: String(toolName || ""),
     tool_use_id: String(toolUseId || ""),
-    result: typeof resultText === "string" ? resultText : safeJsonStringify(resultText, 20000),
+    result: typeof resultText === "string" ? resultText : safeJsonStringify(resultText),
   };
-  return `<mcp_tool_result>${safeJsonStringify(payload, 40000) || "{}"}</mcp_tool_result>`;
+  if (extra && typeof extra === "object") {
+    for (const [k, v] of Object.entries(extra)) {
+      if (v !== undefined) payload[k] = v;
+    }
+  }
+  return `<mcp_tool_result>${safeJsonStringify(payload) || "{}"}</mcp_tool_result>`;
 }
 
 function parseXmlToObject(xml) {
@@ -143,35 +274,52 @@ function parseXmlToObject(xml) {
 
 function tryParseMcpToolCallXml(xmlText, toolName) {
   const name = String(toolName || "");
-  const text = String(xmlText || "").trim();
+  const text = String(xmlText || "");
   if (!name || !text) return null;
 
-  const openRe = new RegExp(`^<${name}(?:\\s[^>]*)?>`, "i");
-  const closeRe = new RegExp(`</${name}\\s*>$`, "i");
-  if (!openRe.test(text) || !closeRe.test(text)) return null;
+  const openRe = new RegExp(`^\\s*<${escapeRegExp(name)}(\\s[^>]*)?>`, "i");
+  const closeRe = new RegExp(`</${escapeRegExp(name)}\\s*>\\s*$`, "i");
+  const selfCloseRe = new RegExp(`^\\s*<${escapeRegExp(name)}(\\s[^>]*)?\\s*/>\\s*$`, "i");
+
+  const selfCloseMatch = text.match(selfCloseRe);
+  if (selfCloseMatch) {
+    const attrs = parseXmlAttributes(selfCloseMatch[1] || "");
+    return { name, input: attrs };
+  }
 
   const openMatch = text.match(openRe);
-  if (!openMatch) return null;
-  const closeStart = text.toLowerCase().lastIndexOf(`</${name.toLowerCase()}`);
-  if (closeStart === -1 || closeStart < openMatch[0].length) return null;
-  const inner = text.slice(openMatch[0].length, closeStart).trim();
-  if (!inner) return { name, input: {} };
+  const closeMatch = text.match(closeRe);
+  if (!openMatch || !closeMatch || typeof closeMatch.index !== "number") return null;
 
-  if (inner.startsWith("{") || inner.startsWith("[")) {
-    try {
-      return { name, input: JSON.parse(inner) };
-    } catch (_) {
-      // fallthrough
-    }
+  const attrs = parseXmlAttributes(openMatch[1] || "");
+  const closeStart = closeMatch.index;
+  if (closeStart < openMatch[0].length) return null;
+  const innerRaw = text.slice(openMatch[0].length, closeStart);
+
+  if (innerRaw.trim().length === 0) {
+    return { name, input: attrs };
   }
 
+  const innerDecoded = decodeXmlEntities(innerRaw);
+  let parsed;
   try {
-    const wrapped = `<root>${inner}</root>`;
-    const obj = parseXmlToObject(wrapped);
-    return { name, input: obj.root ?? obj };
+    parsed = JSON.parse(innerDecoded);
   } catch (_) {
-    return { name, input: { raw: inner } };
+    return null;
   }
+
+  const isPlainObject = parsed && typeof parsed === "object" && !Array.isArray(parsed);
+  if (Object.keys(attrs).length > 0) {
+    if (!isPlainObject) return null;
+    for (const [k, v] of Object.entries(attrs)) {
+      if (Object.prototype.hasOwnProperty.call(parsed, k)) {
+        if (safeJsonStringify(parsed[k]) !== safeJsonStringify(v)) return null;
+      }
+    }
+    parsed = { ...attrs, ...parsed };
+  }
+
+  return { name, input: parsed };
 }
 
 function createMcpXmlStreamParser(toolNames) {
@@ -237,6 +385,18 @@ function createMcpXmlStreamParser(toolNames) {
     if (!text) return out;
     buffer += String(text);
 
+    function findSelfClosingTagEndIndex(src, toolName) {
+      const name = String(toolName || "");
+      const open = `<${name}`;
+      if (!src.startsWith(open)) return -1;
+      const gt = src.indexOf(">", open.length);
+      if (gt === -1) return -1;
+      let i = gt - 1;
+      while (i >= 0 && /\s/.test(src[i])) i--;
+      if (i < 0 || src[i] !== "/") return -1;
+      return gt + 1;
+    }
+
     function findCloseTagEndIndex(src, toolName) {
       const name = String(toolName || "");
       const needle = `</${name}`;
@@ -276,6 +436,16 @@ function createMcpXmlStreamParser(toolNames) {
       if (index > 0) {
         out.push({ type: "text", text: buffer.slice(0, index) });
         buffer = buffer.slice(index);
+      }
+
+      const selfCloseEnd = findSelfClosingTagEndIndex(buffer, name);
+      if (selfCloseEnd !== -1) {
+        const xml = buffer.slice(0, selfCloseEnd);
+        buffer = buffer.slice(selfCloseEnd);
+        const parsed = tryParseMcpToolCallXml(xml, name);
+        if (parsed) out.push({ type: "tool", name: parsed.name, input: parsed.input });
+        else out.push({ type: "text", text: xml });
+        continue;
       }
 
       const closeEnd = findCloseTagEndIndex(buffer, name);
