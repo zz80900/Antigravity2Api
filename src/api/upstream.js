@@ -1,6 +1,7 @@
 const path = require("path");
 
 const httpClient = require("../auth/httpClient");
+const QuotaRefresher = require("./QuotaRefresher");
 
 function parseEnvNonNegativeInt(name, fallback) {
   const raw = process.env[name];
@@ -15,11 +16,6 @@ function parseEnvNonNegativeInt(name, fallback) {
 // - 429 without retryDelay (and after account rotation)
 // - 429 with retryDelay > 5000ms (after rotation)
 const FIXED_RETRY_DELAY_MS = parseEnvNonNegativeInt("AG2API_RETRY_DELAY_MS", 1200);
-
-// Quota refresh interval (seconds). Each tick refreshes ALL accounts concurrently.
-// Default: 300s.
-const QUOTA_REFRESH_S = parseEnvNonNegativeInt("AG2API_QUOTA_REFRESH_S", 300);
-const QUOTA_REFRESH_MS = QUOTA_REFRESH_S * 1000;
 
 // First request will wait up to this long for the initial quota refresh to complete.
 const INITIAL_QUOTA_WAIT_MS = 3000;
@@ -49,17 +45,8 @@ class UpstreamClient {
     this.auth = authManager;
     this.logger = options.logger || null;
 
-    // Per-model quota cache:
-    // model -> (accountKey -> { remainingPercent, resetTimeMs, cooldownUntilMs, updatedAtMs, ... })
-    this.modelQuotaByAccount = new Map();
-    // Cache last HTTP error response per model (for fast-fail when all accounts are exhausted).
-    this.lastErrorByModel = new Map();
-
-    this._quotaRefreshInFlight = false;
-    this._quotaRefreshTimer = null;
-    this._initialQuotaRefreshPromise = null;
-    this._initialQuotaRefreshDone = false;
-    this.startQuotaRefresher();
+    this.quotaRefresher = new QuotaRefresher(this.auth, { logger: this.logger, initialWaitMs: INITIAL_QUOTA_WAIT_MS });
+    this.quotaRefresher.start();
   }
 
   // 基础日志方法（兼容旧 API）
@@ -187,149 +174,6 @@ class UpstreamClient {
     return account?.filePath ? path.basename(account.filePath) : "unknown-account";
   }
 
-  startQuotaRefresher() {
-    if (this._quotaRefreshTimer || this._initialQuotaRefreshPromise) return;
-
-    // Initial refresh: wait for accounts to load (up to INITIAL_QUOTA_WAIT_MS),
-    // then refresh all accounts concurrently.
-    this._initialQuotaRefreshPromise = (async () => {
-      try {
-        const ready = await this.waitForAccountsReady(INITIAL_QUOTA_WAIT_MS);
-        if (!ready) return;
-        if (this.auth && typeof this.auth.waitInitialTokenRefresh === "function") {
-          await this.auth.waitInitialTokenRefresh();
-        }
-        await this.refreshAllAccountQuotas();
-      } catch (e) {
-        this.logError("额度刷新失败", e);
-      }
-    })().finally(() => {
-      this._initialQuotaRefreshDone = true;
-    });
-
-    if (!Number.isFinite(QUOTA_REFRESH_MS) || QUOTA_REFRESH_MS <= 0) return;
-
-    const tick = async () => {
-      try {
-        await this.refreshAllAccountQuotas();
-      } catch (e) {
-        this.logError("额度刷新失败", e);
-      }
-    };
-
-    this._quotaRefreshTimer = setInterval(() => tick(), QUOTA_REFRESH_MS);
-    if (this._quotaRefreshTimer && typeof this._quotaRefreshTimer.unref === "function") this._quotaRefreshTimer.unref();
-  }
-
-  async waitForAccountsReady(timeoutMs) {
-    const timeout = Number.isFinite(timeoutMs) ? timeoutMs : 0;
-    if (timeout <= 0) {
-      const count = this.auth && typeof this.auth.getAccountCount === "function" ? this.auth.getAccountCount() : 0;
-      return count > 0;
-    }
-
-    const deadline = Date.now() + timeout;
-    while (Date.now() < deadline) {
-      const count = this.auth && typeof this.auth.getAccountCount === "function" ? this.auth.getAccountCount() : 0;
-      if (count > 0) return true;
-      await this.sleep(50);
-    }
-
-    const count = this.auth && typeof this.auth.getAccountCount === "function" ? this.auth.getAccountCount() : 0;
-    return count > 0;
-  }
-
-  async refreshAllAccountQuotas() {
-    if (this._quotaRefreshInFlight) return;
-    if (!this.auth || typeof this.auth.getAccountCount !== "function") return;
-
-    const accountCount = this.auth.getAccountCount();
-    if (!accountCount) return;
-
-    this._quotaRefreshInFlight = true;
-
-    try {
-      const now = Date.now();
-      const perAccount = [];
-
-      for (let accountIndex = 0; accountIndex < accountCount; accountIndex++) {
-        perAccount.push(
-          (async () => {
-            let account = null;
-            let accessToken = null;
-
-            try {
-              if (typeof this.auth.getAccessTokenByIndex === "function") {
-                const creds = await this.auth.getAccessTokenByIndex(accountIndex, "gemini");
-                account = creds.account;
-                accessToken = creds.accessToken;
-              } else if (Array.isArray(this.auth.accounts)) {
-                account = this.auth.accounts[accountIndex];
-                accessToken = account?.creds?.access_token || null;
-              }
-            } catch (e) {
-              const accountKey = this.getAccountKeyFromAccount(account) || `account_${accountIndex}`;
-              return { accountKey, ok: false, error: e };
-            }
-
-            const accountKey = this.getAccountKeyFromAccount(account);
-            if (!accessToken) {
-              return { accountKey, ok: false, error: new Error("Missing access_token") };
-            }
-            try {
-              const models = await httpClient.fetchAvailableModels(accessToken, null);
-              return { accountKey, ok: true, models };
-            } catch (e) {
-              return { accountKey, ok: false, error: e };
-            }
-          })(),
-        );
-      }
-
-      const results = await Promise.all(perAccount);
-
-      const failed = results.filter((r) => !r || !r.ok);
-      for (const item of failed) {
-        const accountKey = item?.accountKey || "unknown-account";
-        const message = String(item?.error?.message || item?.error || "unknown error")
-          .split("\n")[0]
-          .slice(0, 200);
-        this.log("quota", `额度刷新失败 @${accountKey}${message ? ` (${message})` : ""}`);
-      }
-
-      this.log("quota", `额度刷新完成 ok=${results.length - failed.length} fail=${failed.length}`);
-
-      for (const item of results) {
-        if (!item || !item.ok || !item.models || typeof item.models !== "object") continue;
-        const { accountKey, models } = item;
-
-        for (const modelId of Object.keys(models)) {
-          const quotaInfo = models[modelId]?.quotaInfo || {};
-          const remainingFraction = quotaInfo.remainingFraction;
-          const remainingPercent =
-            remainingFraction !== undefined && remainingFraction !== null ? Math.round(remainingFraction * 100) : null;
-          const resetTime = quotaInfo.resetTime || null;
-          const resetTimeMs = resetTime ? Date.parse(resetTime) : null;
-
-          const perModel = this.modelQuotaByAccount.get(modelId) || new Map();
-          const prev = perModel.get(accountKey) || {};
-          perModel.set(accountKey, {
-            ...prev,
-            remainingFraction,
-            remainingPercent,
-            resetTime,
-            resetTimeMs: Number.isFinite(resetTimeMs) ? resetTimeMs : null,
-            updatedAtMs: now,
-          });
-          this.modelQuotaByAccount.set(modelId, perModel);
-        }
-      }
-
-    } finally {
-      this._quotaRefreshInFlight = false;
-    }
-  }
-
   parseErrorDetails(errText) {
     try {
       const errObj = JSON.parse(errText);
@@ -349,121 +193,6 @@ class UpstreamClient {
       const timer = setTimeout(resolve, ms);
       if (timer && typeof timer.unref === "function") timer.unref();
     });
-  }
-
-  setCooldownUntil(modelId, accountKey, cooldownUntilMs) {
-    const key = String(modelId || "").trim();
-    if (!key) return;
-    const perModel = this.modelQuotaByAccount.get(key) || new Map();
-    const prev = perModel.get(accountKey) || {};
-    perModel.set(accountKey, {
-      ...prev,
-      cooldownUntilMs: Number.isFinite(cooldownUntilMs) ? cooldownUntilMs : null,
-    });
-    this.modelQuotaByAccount.set(key, perModel);
-  }
-
-  async cacheLastErrorResponse(modelId, response) {
-    const key = String(modelId || "").trim();
-    if (!key || !response) return;
-
-    let bodyText = "";
-    try {
-      bodyText = await response.clone().text();
-    } catch (_) {}
-
-    const headers = {};
-    try {
-      response.headers?.forEach?.((value, name) => {
-        headers[name] = value;
-      });
-    } catch (_) {}
-
-    this.lastErrorByModel.set(key, {
-      status: response.status,
-      headers,
-      bodyText,
-      cachedAtMs: Date.now(),
-    });
-  }
-
-  getCachedErrorResponse(modelId) {
-    const key = String(modelId || "").trim();
-    if (!key) return null;
-    const cached = this.lastErrorByModel.get(key);
-    if (!cached) return null;
-    try {
-      return new Response(cached.bodyText || "", {
-        status: cached.status || 500,
-        headers: cached.headers || {},
-      });
-    } catch (_) {
-      return null;
-    }
-  }
-
-  getAccountPrioritiesForModel(modelId, options = {}) {
-    const now = Number.isFinite(options.now) ? options.now : Date.now();
-    const includeZero = !!options.includeZero;
-    const excludeAccountIndices = options.excludeAccountIndices instanceof Set ? options.excludeAccountIndices : new Set();
-
-    const accounts = Array.isArray(this.auth?.accounts) ? this.auth.accounts : [];
-    const perModel = this.modelQuotaByAccount.get(String(modelId || "").trim());
-
-    let knownCount = 0;
-    let nonZeroKnownCount = 0;
-    const items = [];
-
-    for (let accountIndex = 0; accountIndex < accounts.length; accountIndex++) {
-      if (excludeAccountIndices.has(accountIndex)) continue;
-
-      const account = accounts[accountIndex];
-      const accountKey = this.getAccountKeyFromAccount(account);
-      const q = perModel ? perModel.get(accountKey) : null;
-
-      const remainingPercent = Number.isFinite(q?.remainingPercent) ? q.remainingPercent : null;
-      if (remainingPercent !== null) {
-        knownCount++;
-        if (remainingPercent > 0) nonZeroKnownCount++;
-      }
-
-      if (!includeZero && remainingPercent === 0) continue;
-
-      const resetTimeMs = Number.isFinite(q?.resetTimeMs) ? q.resetTimeMs : null;
-      const cooldownUntilMs = Number.isFinite(q?.cooldownUntilMs) ? q.cooldownUntilMs : 0;
-
-      items.push({
-        accountIndex,
-        accountKey,
-        remainingPercent,
-        resetTimeMs,
-        cooldownUntilMs,
-        cooldownActive: cooldownUntilMs > now,
-      });
-    }
-
-    items.sort((a, b) => {
-      if (a.cooldownActive !== b.cooldownActive) return a.cooldownActive ? 1 : -1;
-
-      const aPct = a.remainingPercent !== null ? a.remainingPercent : -1;
-      const bPct = b.remainingPercent !== null ? b.remainingPercent : -1;
-      if (aPct !== bPct) return bPct - aPct;
-
-      const aReset = Number.isFinite(a.resetTimeMs) ? a.resetTimeMs : Number.POSITIVE_INFINITY;
-      const bReset = Number.isFinite(b.resetTimeMs) ? b.resetTimeMs : Number.POSITIVE_INFINITY;
-      if (aReset !== bReset) return aReset - bReset;
-
-      return a.accountIndex - b.accountIndex;
-    });
-
-    const allKnown = accounts.length > 0 && knownCount === accounts.length;
-    const allZeroKnown = allKnown && nonZeroKnownCount === 0;
-
-    return {
-      items,
-      allKnown,
-      allZeroKnown,
-    };
   }
 
   /**
@@ -500,112 +229,81 @@ class UpstreamClient {
     });
 
     // Best-effort: wait for initial quota refresh so the first request can pick the best account.
-    if (modelId && this._initialQuotaRefreshPromise && !this._initialQuotaRefreshDone) {
+    if (modelId && this.quotaRefresher) {
       try {
-        await Promise.race([this._initialQuotaRefreshPromise, this.sleep(INITIAL_QUOTA_WAIT_MS)]);
+        await this.quotaRefresher.waitInitialRefresh(INITIAL_QUOTA_WAIT_MS);
       } catch (_) {}
     }
 
-    // Fast-fail: if we KNOW all accounts have 0% quota for this model, do not try all accounts.
-    if (modelId) {
-      const snapshot = this.getAccountPrioritiesForModel(modelId, { includeZero: true, now: Date.now() });
-      if (snapshot.allZeroKnown) {
-        const cached = this.getCachedErrorResponse(modelId);
-        if (cached) return cached;
-
-        const pick = snapshot.items[0];
-        if (!pick) {
-          throw new Error(`No accounts available for model ${modelId}`);
-        }
-
-        let creds;
-        try {
-          creds = await this.auth.getCredentialsByIndex(pick.accountIndex, quotaGroup);
-        } catch (e) {
-          this.logError(`获取凭证失败 [${quotaGroup}]`, e, { attempt: 1, maxAttempts: 1 });
-          throw e;
-        }
-
-        const accountName = this.getAccountKeyFromAccount(creds.account);
-        const requestBody = buildBody(creds.projectId);
-        const startTime = Date.now();
-
-        this.logUpstream(`发送请求`, {
-          method,
-          account: accountName,
-          group: quotaGroup,
-          attempt: 1,
-          maxAttempts: 1,
-          model: modelId,
-        });
-
-        let response;
-        try {
-          response = await httpClient.callV1Internal(method, creds.accessToken, requestBody, {
-            queryString,
-            headers,
-            limiter: this.auth.apiLimiter,
-          });
-        } catch (netErr) {
-          const duration = Date.now() - startTime;
-          this.logError(`网络错误`, netErr, {
-            context: {
-              method: `v1internal:${method}`,
-              group: quotaGroup,
-              account: accountName,
-              attempt: 1,
-              maxAttempts: 1,
-              duration,
-            },
-          });
-          throw netErr;
-        }
-
-        if (!response.ok) {
-          await this.cacheLastErrorResponse(modelId, response);
-        }
-
-        return response;
-      }
-    }
-
     const triedAccountIndices = new Set();
+    let waitedForCooldown = false;
+    let attemptNum = 0;
 
-    for (let attempts = 0; attempts < maxAttempts; attempts++) {
-      const attemptNum = attempts + 1;
+    while (attemptNum < maxAttempts) {
       const now = Date.now();
 
-      let picked = null;
-      if (modelId) {
-        const { items } = this.getAccountPrioritiesForModel(modelId, { now, excludeAccountIndices: triedAccountIndices });
-        if (items.length === 0) break;
+      let accountIndex;
+      if (modelId && this.quotaRefresher) {
+        const decision = this.quotaRefresher.pickAccountIndex(modelId, {
+          now,
+          excludeAccountIndices: triedAccountIndices,
+          cooldownWaitThresholdMs: 5000,
+        });
 
-        if (items.every((item) => item.cooldownActive)) {
-          const cached = this.getCachedErrorResponse(modelId);
+        if (decision?.kind === "wait") {
+          if (waitedForCooldown) {
+            const cached = this.quotaRefresher.getCachedErrorResponse(modelId);
+            if (cached) return cached;
+            if (lastResponse) return lastResponse;
+            if (lastNetworkError) throw lastNetworkError;
+            throw new Error(`All accounts are in cooldown for model ${modelId}`);
+          }
+
+          waitedForCooldown = true;
+          const waitMs = Math.max(0, Number(decision.waitMs) || 0);
+          this.logRetry("所有账户冷却中，等待后重试", {
+            attempt: attemptNum + 1,
+            maxAttempts,
+            delayMs: waitMs,
+            nextAction: "等待冷却结束后重新选择账户",
+          });
+          await this.sleep(waitMs);
+          triedAccountIndices.clear();
+          continue;
+        }
+
+        if (decision?.kind === "fast_fail") {
+          if (decision.response) return decision.response;
+          const cached = this.quotaRefresher.getCachedErrorResponse(modelId);
           if (cached) return cached;
           if (lastResponse) return lastResponse;
           if (lastNetworkError) throw lastNetworkError;
-          throw new Error(`All accounts are in cooldown for model ${modelId}`);
+          throw new Error(`No accounts available for model ${modelId}`);
         }
 
-        picked = items[0];
+        if (decision?.kind !== "pick" || !Number.isInteger(decision.accountIndex)) {
+          const cached = this.quotaRefresher.getCachedErrorResponse(modelId);
+          if (cached) return cached;
+          if (lastResponse) return lastResponse;
+          if (lastNetworkError) throw lastNetworkError;
+          throw new Error(`Failed to pick an account for model ${modelId}`);
+        }
+
+        accountIndex = decision.accountIndex;
       } else {
-        // If model is unknown, fall back to current account selection by group index.
-        picked = {
-          accountIndex: this.auth?.getCurrentAccountIndex ? this.auth.getCurrentAccountIndex(quotaGroup) : 0,
-          accountKey: "unknown-account",
-          remainingPercent: null,
-          resetTimeMs: null,
-          cooldownUntilMs: 0,
-          cooldownActive: false,
-        };
+        accountIndex = this.auth?.getCurrentAccountIndex ? this.auth.getCurrentAccountIndex(quotaGroup) : 0;
       }
 
-      triedAccountIndices.add(picked.accountIndex);
+      triedAccountIndices.add(accountIndex);
+      attemptNum++;
+
+      if (this.auth?.setCurrentAccountIndex && modelId) {
+        this.auth.setCurrentAccountIndex(quotaGroup, accountIndex);
+      }
 
       let creds;
       try {
-        creds = await this.auth.getCredentialsByIndex(picked.accountIndex, quotaGroup);
+        creds = await this.auth.getCredentialsByIndex(accountIndex, quotaGroup);
       } catch (e) {
         this.logError(`获取凭证失败 [${quotaGroup}]`, e, { attempt: attemptNum, maxAttempts });
         throw e;
@@ -710,6 +408,10 @@ class UpstreamClient {
         return response;
       }
 
+      if (modelId && this.quotaRefresher) {
+        await this.quotaRefresher.cacheLastErrorResponse(modelId, response);
+      }
+
       // Non-429 4xx: do not retry/rotate, pass through as-is.
       if (response.status !== 429) {
         let errorText = "";
@@ -729,17 +431,10 @@ class UpstreamClient {
           duration,
           error: errorDetails,
         });
-
-        if (modelId) {
-          await this.cacheLastErrorResponse(modelId, response);
-        }
         return response;
       }
 
       lastResponse = response;
-      if (modelId) {
-        await this.cacheLastErrorResponse(modelId, response);
-      }
 
       // 429: decide short-wait retry vs rotate.
       let errorText = "";
@@ -758,9 +453,9 @@ class UpstreamClient {
 
       this.log("error", `🚫 Google API 429 错误详情`, errorDetails);
 
-      if (modelId) {
+      if (modelId && this.quotaRefresher) {
         const cooldownUntil = now + (retryMs != null ? Math.max(0, retryMs) : FIXED_RETRY_DELAY_MS);
-        this.setCooldownUntil(modelId, accountName, cooldownUntil);
+        this.quotaRefresher.setCooldownUntil(modelId, accountName, cooldownUntil);
       }
 
       if (maxAttempts === 1) {
@@ -819,8 +514,8 @@ class UpstreamClient {
           return retryResp;
         }
 
-        if (modelId) {
-          await this.cacheLastErrorResponse(modelId, retryResp);
+        if (modelId && this.quotaRefresher) {
+          await this.quotaRefresher.cacheLastErrorResponse(modelId, retryResp);
         }
 
         if (retryResp.status !== 429) {
@@ -876,7 +571,7 @@ class UpstreamClient {
       throw lastNetworkError;
     }
 
-    const cached = modelId ? this.getCachedErrorResponse(modelId) : null;
+    const cached = modelId && this.quotaRefresher ? this.quotaRefresher.getCachedErrorResponse(modelId) : null;
     if (cached) return cached;
 
     const error = new Error(`Upstream call exhausted without a response (v1internal:${method})`);
@@ -891,6 +586,13 @@ class UpstreamClient {
     const accessToken = await this.auth.getCurrentAccessToken();
     this.log("info", "📋 获取可用模型列表");
     return httpClient.fetchAvailableModels(accessToken, this.auth.apiLimiter);
+  }
+
+  async fetchAvailableModelsByAccountIndex(accountIndex) {
+    if (!this.quotaRefresher) {
+      throw new Error("QuotaRefresher not initialized");
+    }
+    return this.quotaRefresher.fetchModelsByAccountIndex(accountIndex);
   }
 
   /**

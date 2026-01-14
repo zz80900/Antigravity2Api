@@ -1,5 +1,4 @@
 const path = require("path");
-const httpClient = require("../auth/httpClient");
 
 function getAccountsPayload(authManager) {
   const accounts = authManager.getAccountsSummary();
@@ -39,18 +38,8 @@ async function getAccountQuota(authManager, fileName, upstreamClient) {
   }
 
   const accountIndex = authManager.accounts.indexOf(account);
-  const originalClaudeIdx = authManager.getCurrentAccountIndex("claude");
-  const originalGeminiIdx = authManager.getCurrentAccountIndex("gemini");
 
-  let models;
-  try {
-    authManager.setCurrentAccountIndex("claude", accountIndex);
-    authManager.setCurrentAccountIndex("gemini", accountIndex);
-    models = await upstreamClient.fetchAvailableModels();
-  } finally {
-    authManager.setCurrentAccountIndex("claude", originalClaudeIdx);
-    authManager.setCurrentAccountIndex("gemini", originalGeminiIdx);
-  }
+  const models = await upstreamClient.fetchAvailableModelsByAccountIndex(accountIndex);
   
   const result = [];
   if (models && typeof models === "object") {
